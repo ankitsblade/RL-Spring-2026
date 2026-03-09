@@ -1,7 +1,6 @@
 import os
 import numpy as np
 import matplotlib.pyplot as plt
-import torch
 import pickle
 
 from RideSharing import DynamicPricingEnv
@@ -9,10 +8,8 @@ from features import get_features, set_env_bounds
 
 from lin_greedy import EpsilonGreedyLinearBandit, N_BINS, FEATURE_DIM, LAMBDA
 from lin_ucb import UCBLinearBandit
-from policy_gradient import PolicyNetwork, sample_action, log_prob, \
-                            LEARNING_RATE, BASELINE_DECAY, GRAD_CLIP
 
-TRAIN_EPISODES = 50
+TRAIN_EPISODES = 10
 
 
 def train_greedy(env):
@@ -63,51 +60,6 @@ def train_ucb(env):
     return bandit
 
 
-def train_pg(env):
-    import torch.optim as optim
-    path   = "sanity_pg.pt"
-    policy = PolicyNetwork(input_dim=8)
-    if os.path.exists(path):
-        print("  Policy Gradient: loading saved weights...")
-        policy.load_state_dict(torch.load(path, weights_only=True))
-        return policy
-    print(f"  Training Policy Gradient ({TRAIN_EPISODES} episodes)...")
-    optimizer = optim.Adam(policy.parameters(), lr=LEARNING_RATE)
-    baseline  = 0.0
-    for ep in range(TRAIN_EPISODES):
-        context, _   = env.reset()
-        ep_log_probs = []
-        ep_rewards   = []
-        ep_reward    = 0.0
-        for t in range(env.Horizon):
-            ctx_feat      = get_features(context)
-            x             = torch.tensor(ctx_feat, dtype=torch.float32)
-            mu_raw, sigma = policy(x)
-            a, z          = sample_action(mu_raw, sigma)
-            price         = float(a.detach().squeeze().numpy()) * env.MaxRideCost
-            context, reward, _, truncated, _ = env.step(price)
-            ep_log_probs.append(log_prob(a, z, mu_raw, sigma))
-            ep_rewards.append(reward)
-            ep_reward += reward
-            if truncated: break
-        ep_mean  = ep_reward / len(ep_rewards)
-        baseline = BASELINE_DECAY * baseline + (1 - BASELINE_DECAY) * ep_mean
-        rewards_t  = torch.tensor(ep_rewards, dtype=torch.float32)
-        advantages = rewards_t - baseline
-        adv_std    = advantages.std()
-        if adv_std > 1e-8:
-            advantages = (advantages - advantages.mean()) / (adv_std + 1e-8)
-        total_loss = -(advantages * torch.stack(ep_log_probs)).mean()
-        optimizer.zero_grad()
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(policy.parameters(), GRAD_CLIP)
-        optimizer.step()
-        print(f"    ep {ep+1}/{TRAIN_EPISODES}", flush=True)
-    torch.save(policy.state_dict(), path)
-    print("  Policy Gradient done.")
-    return policy
-
-
 def make_context(env, alpha_p, n_drivers, alpha_d_list):
     x_o = env.max_x * 0.3;  y_o = env.max_y * 0.3
     x_f = env.max_x * 0.7;  y_f = env.max_y * 0.7
@@ -130,31 +82,21 @@ def get_price_ucb(bandit, context):
     _, price, _ = bandit.select_action(ctx_feat)
     return price
 
-def get_price_pg(policy, context, env):
-    ctx_feat = get_features(context)
-    x = torch.tensor(ctx_feat, dtype=torch.float32)
-    with torch.no_grad():
-        mu_raw, _ = policy(x)
-        a = torch.sigmoid(mu_raw)
-    return float(a.squeeze().numpy()) * env.MaxRideCost
 
-
-def test1_price_vs_passenger_sensitivity(env, greedy, ucb, pg):
+def test1_price_vs_passenger_sensitivity(env, greedy, ucb):
     alpha_p_values = np.linspace(0.05 * env.MaxTheta_p, 0.95 * env.MaxTheta_p, 30)
     alpha_d_list   = [0.5 * env.MaxTheta_d] * 3
 
-    prices_greedy, prices_ucb, prices_pg = [], [], []
+    prices_greedy, prices_ucb = [], []
     for alpha_p in alpha_p_values:
         context = make_context(env, alpha_p, 3, alpha_d_list)
         prices_greedy.append(get_price_greedy(greedy, context))
         prices_ucb.append(get_price_ucb(ucb, context))
-        prices_pg.append(get_price_pg(pg, context, env))
 
     alpha_p_norm = alpha_p_values / env.MaxTheta_p
     fig, ax = plt.subplots(figsize=(10, 5))
     ax.plot(alpha_p_norm, prices_greedy, 'b-o', markersize=4, label='e-Greedy')
     ax.plot(alpha_p_norm, prices_ucb,    '-o',  markersize=4, label='UCB', color='darkorange')
-    ax.plot(alpha_p_norm, prices_pg,     '-o',  markersize=4, label='Policy Gradient', color='purple')
     ax.set_xlabel("Passenger Sensitivity (normalised)")
     ax.set_ylabel("Predicted Price")
     ax.set_title("Test 1: Price vs Passenger Sensitivity")
@@ -165,22 +107,20 @@ def test1_price_vs_passenger_sensitivity(env, greedy, ucb, pg):
     plt.show()
 
 
-def test2_price_vs_num_drivers(env, greedy, ucb, pg):
+def test2_price_vs_num_drivers(env, greedy, ucb):
     driver_counts = list(range(1, 11))
     mid_alpha_p   = 0.5 * env.MaxTheta_p
     mid_alpha_d   = 0.5 * env.MaxTheta_d
 
-    prices_greedy, prices_ucb, prices_pg = [], [], []
+    prices_greedy, prices_ucb = [], []
     for n in driver_counts:
         context = make_context(env, mid_alpha_p, n, [mid_alpha_d] * n)
         prices_greedy.append(get_price_greedy(greedy, context))
         prices_ucb.append(get_price_ucb(ucb, context))
-        prices_pg.append(get_price_pg(pg, context, env))
 
     fig, ax = plt.subplots(figsize=(10, 5))
     ax.plot(driver_counts, prices_greedy, 'b-o', markersize=6, label='e-Greedy')
     ax.plot(driver_counts, prices_ucb,    '-o',  markersize=6, label='UCB', color='darkorange')
-    ax.plot(driver_counts, prices_pg,     '-o',  markersize=6, label='Policy Gradient', color='purple')
     ax.set_xlabel("Number of Nearby Drivers")
     ax.set_ylabel("Predicted Price")
     ax.set_title("Test 2: Price vs Number of Drivers")
@@ -198,7 +138,6 @@ if __name__ == "__main__":
 
     greedy = train_greedy(env)
     ucb    = train_ucb(env)
-    pg     = train_pg(env)
 
-    test1_price_vs_passenger_sensitivity(env, greedy, ucb, pg)
-    test2_price_vs_num_drivers(env, greedy, ucb, pg)
+    test1_price_vs_passenger_sensitivity(env, greedy, ucb)
+    test2_price_vs_num_drivers(env, greedy, ucb)
