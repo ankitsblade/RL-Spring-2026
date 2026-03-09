@@ -1,3 +1,63 @@
+"""
+policy_gradient.py
+==================
+Policy Gradient for Contextual Bandits — Dynamic Pricing in Ride Sharing.
+
+HOW IT WORKS
+------------
+Unlike linear bandits (which discretise the action space), policy gradient
+works directly with continuous actions.
+
+1. A neural network takes the 8-dim context vector as input and outputs
+   a mean price mu (after sigmoid squashing to keep it in [0, 1]).
+
+2. The actual price shown is sampled from a Gaussian centred at mu:
+       z ~ N(mu_raw, sigma^2)          raw sample (unbounded)
+       a = sigmoid(z)                  squash to (0, 1)
+
+   where mu_raw is the pre-sigmoid network output and sigma is a learnable
+   scalar parameter (log_sigma is what we actually store and optimise).
+
+3. POLICY GRADIENT UPDATE
+   We want to maximise expected reward J(theta).
+   The gradient estimator is:
+       grad J = E[ reward * grad log pi(a|x) ]
+
+   For a Gaussian policy with sigmoid squashing:
+       log pi(a|x) = log N(z; mu_raw, sigma^2)
+                     - log | d(sigmoid(z))/dz |
+                   = log N(z; mu_raw, sigma^2)
+                     - log(a * (1 - a))          <-- THE NOT-SO-OBVIOUS TERM
+
+   The second term is the log absolute Jacobian of the sigmoid transform.
+   It corrects for the fact that sigmoid compresses probability mass near
+   0 and 1. Without it the gradient is WRONG. (Worth 5 marks per assignment.)
+
+4. LOSS FUNCTION
+   We do gradient DESCENT to maximise J, so:
+       loss = -reward * log_prob
+   where log_prob includes the Jacobian correction.
+
+5. BASELINE
+   We subtract a running mean reward baseline from the reward before
+   computing the loss. This reduces variance without changing the expected
+   gradient (standard REINFORCE trick):
+       loss = -(reward - baseline) * log_prob
+
+ARCHITECTURE
+------------
+   Input (8) -> Dense(64, ReLU) -> Dense(32, ReLU) -> Output(1, linear)
+   The output is mu_raw (pre-sigmoid mean).
+   log_sigma is a separate trainable scalar.
+
+DEPENDENCIES
+------------
+    pip install gymnasium numpy matplotlib Pillow scipy torch
+Place in the same folder as:
+    RideSharing.py, features.py, map_agent.png,
+    map_environment.png, pre_computed_distance_matrix.npy
+"""
+
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
@@ -11,23 +71,43 @@ from features import get_features, set_env_bounds
 # HYPERPARAMETERS
 # =============================================================================
 
-N_EPISODES      = 200     
-LEARNING_RATE   = 3e-4   
-SIGMA_INIT      = 0.5
+N_EPISODES      = 200     # total training episodes
+                          # instructor saw improvement after 40-75 episodes
+                          # be patient, don't stop early
 
-SIGMA_MIN       = 0.05   
+LEARNING_RATE   = 1e-4    # reduced from 3e-4 to prevent overshooting
 
-BASELINE_DECAY  = 0.99 
+SIGMA_INIT      = 0.8     # higher initial std dev = more exploration early on
 
-WINDOW_SIZE     = 2000   
+SIGMA_MIN       = 0.10    # raised from 0.05 — keep exploring throughout
 
-EPSILON_CLIP    = 1e-6 
+BASELINE_DECAY  = 0.95    # faster baseline warmup (was 0.99)
+                          # 0.99 was too slow — early advantages were noisy
+                          # 0.95 tracks recent rewards more responsively
+
+WINDOW_SIZE     = 2000    # receding window size for reward plot
+
+EPSILON_CLIP    = 1e-6    # numerical safety: keep a away from exact 0 or 1
+                          # to prevent log(0) in Jacobian correction
+
+GRAD_CLIP       = 1.0     # gradient clipping — prevents exploding gradients
 
 # =============================================================================
 # NEURAL NETWORK POLICY
 # =============================================================================
 
 class PolicyNetwork(nn.Module):
+    """
+    Maps context features -> mean price (mu_raw, pre-sigmoid).
+
+    Architecture: Input(8) -> Dense(64, ReLU) -> Dense(32, ReLU) -> Output(1)
+
+    The output is the RAW mean (unbounded). We apply sigmoid separately
+    during action sampling so we can correctly compute the Jacobian correction.
+
+    log_sigma is a separate learnable parameter (not part of the network layers)
+    because the std dev doesn't need to depend on the context for this problem.
+    """
 
     def __init__(self, input_dim=8):
         super(PolicyNetwork, self).__init__()
@@ -37,9 +117,11 @@ class PolicyNetwork(nn.Module):
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Linear(32, 1),      
+            nn.Linear(32, 1),       # outputs mu_raw (scalar, unbounded)
         )
 
+        # Separate learnable log_sigma (log scale for numerical stability)
+        # Initialise so that sigma = SIGMA_INIT
         self.log_sigma = nn.Parameter(
             torch.tensor(np.log(SIGMA_INIT), dtype=torch.float32)
         )
@@ -108,6 +190,30 @@ def log_prob(a, z, mu_raw, sigma):
 
     Therefore:
         log pi(a|x) = log N(z; mu_raw, sigma^2) - log(a) - log(1-a)
+
+    WHY IS THIS TERM NEEDED?
+    ------------------------
+    When we transform z through sigmoid, the probability density changes.
+    The Jacobian correction accounts for how much sigmoid "stretches" or
+    "compresses" the distribution at each point.
+    Near a=0 or a=1: sigmoid is very flat -> densities get compressed
+                     -> Jacobian correction is large
+    Near a=0.5:      sigmoid is steep  -> densities get stretched
+                     -> Jacobian correction is small
+
+    Without this correction, the gradient points in the wrong direction
+    because we'd be computing the log prob of z, not of a.
+
+    Parameters
+    ----------
+    a      : torch.Tensor  sigmoid output (the actual action), in (0,1)
+    z      : torch.Tensor  pre-sigmoid sample
+    mu_raw : torch.Tensor  pre-sigmoid mean from network
+    sigma  : torch.Tensor  std dev
+
+    Returns
+    -------
+    log_p : torch.Tensor  scalar log probability
     """
     # Gaussian log probability of z
     dist         = torch.distributions.Normal(mu_raw, sigma)
@@ -145,13 +251,14 @@ def receding_window_avg(rewards, window):
 # =============================================================================
 
 def train():
+    # ------------------------------------------------------------------ setup
     env = DynamicPricingEnv()
     set_env_bounds(env)
 
     policy    = PolicyNetwork(input_dim=8)
     optimizer = optim.Adam(policy.parameters(), lr=LEARNING_RATE)
 
-    baseline    = 0.0    
+    baseline    = 0.0      # running mean reward (for variance reduction)
     all_rewards = []
     total_steps = 0
 
@@ -169,10 +276,15 @@ def train():
         context, _  = env.reset()
         ep_reward   = 0.0
 
+        # Collect experience for the full episode first,
+        # then do one gradient update at the end.
+        # This is standard REINFORCE — more stable than per-step updates.
         ep_log_probs = []   # log pi(a_t | x_t) for each timestep
         ep_rewards   = []   # r_t for each timestep
 
         for t in range(env.Horizon):
+            # --------------------------------------------------------- forward
+            # 1. Get context features (8-dim vector)
             ctx_feat = get_features(context)
             x        = torch.tensor(ctx_feat, dtype=torch.float32)
 
@@ -186,6 +298,7 @@ def train():
             # .squeeze() removes extra dimensions e.g. (1,1) -> scalar
             price = float(a.detach().squeeze().numpy()) * env.MaxRideCost
 
+            # ------------------------------------------------------------ step
             # 5. Take action in environment
             next_context, reward, terminated, truncated, _ = env.step(price)
 
@@ -195,6 +308,7 @@ def train():
             ep_log_probs.append(log_p)
             ep_rewards.append(reward)
 
+            # ------------------------------------------------------- tracking
             all_rewards.append(reward)
             ep_reward  += reward
             total_steps += 1
@@ -203,10 +317,15 @@ def train():
             if truncated or terminated:
                 break
 
+        # --------------------------------------------- end-of-episode update
         # Update baseline using this episode's mean reward
         ep_mean_reward = ep_reward / len(ep_rewards)
         baseline = BASELINE_DECAY * baseline + (1 - BASELINE_DECAY) * ep_mean_reward
 
+        # Compute total loss over all timesteps in this episode:
+        #   loss = -1/T * sum_t [ (r_t - baseline) * log pi(a_t | x_t) ]
+        # Negative because PyTorch minimises but we want to maximise reward.
+        # Dividing by T keeps gradient magnitude stable across episode lengths.
         total_loss = torch.stack([
             -(torch.tensor(r - baseline, dtype=torch.float32) * log_p)
             for log_p, r in zip(ep_log_probs, ep_rewards)
@@ -215,6 +334,8 @@ def train():
         # Backprop and update all network weights (including log_sigma)
         optimizer.zero_grad()
         total_loss.backward()
+        # Clip gradients to prevent exploding updates
+        torch.nn.utils.clip_grad_norm_(policy.parameters(), GRAD_CLIP)
         optimizer.step()
 
         avg = ep_reward / env.Horizon
@@ -229,6 +350,7 @@ def train():
     print(f"  Training done.  Total steps = {total_steps}")
     print("=" * 60)
 
+    # ------------------------------------------------------------------- plot
     smoothed = receding_window_avg(all_rewards, WINDOW_SIZE)
     steps    = np.arange(1, len(all_rewards) + 1)
 
@@ -250,6 +372,9 @@ def train():
     print("  Plot saved → policy_gradient_reward.png")
 
 
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
 
 if __name__ == "__main__":
     train()

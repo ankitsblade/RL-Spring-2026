@@ -38,9 +38,17 @@ Place in the same folder as:
 
 import numpy as np
 import matplotlib.pyplot as plt
+import random
 
 from RideSharing import DynamicPricingEnv
 from features import get_features, set_env_bounds
+
+# =============================================================================
+# SEEDING  — set once at the top for full reproducibility
+# =============================================================================
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
 
 # =============================================================================
 # HYPERPARAMETERS  (tune these)
@@ -207,7 +215,8 @@ def receding_window_avg(rewards, window):
 def train():
     # ------------------------------------------------------------------ setup
     env = DynamicPricingEnv()
-    set_env_bounds(env)          # must be called once before get_features()
+    env.reset()                  # reset the environment
+    set_env_bounds(env)
 
     bandit = EpsilonGreedyLinearBandit(
         n_bins      = N_BINS,
