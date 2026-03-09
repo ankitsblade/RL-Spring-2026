@@ -1,40 +1,4 @@
-"""
-lin_greedy.py
-=============
-Epsilon-greedy Linear Bandit for Dynamic Pricing in Ride Sharing.
 
-HOW IT WORKS (brief)
---------------------
-1. The context (passenger + driver info) is converted to an 8-dim feature
-   vector by features.py (A* distances + sensitivity values).
-
-2. The continuous action space [0, MaxRideCost] is discretised into N_BINS
-   evenly-spaced price bins.  Each bin is treated as a separate "arm".
-
-3. For every arm i we maintain a linear model:
-       E[reward | phi, arm=i]  ~=  phi(context, i)^T  *  theta_i
-   where  phi  is the concatenation of the 8 context features with the
-   arm's price value (and a bias term) -- giving a 10-dim feature vector.
-
-4. Parameters are updated online with ridge-regularised least squares:
-       A_i  <-  A_i + phi * phi^T
-       b_i  <-  b_i + reward * phi
-       theta_i  =  A_i^{-1} b_i
-
-5. Action selection: with probability epsilon pick a random arm (explore),
-   otherwise pick the arm with highest predicted reward (exploit).
-
-6. Epsilon decays exponentially from EPSILON_START to EPSILON_MIN.
-
-7. After training, a receding-window time-averaged reward plot is saved.
-
-DEPENDENCIES
-------------
-    pip install gymnasium numpy matplotlib Pillow scipy
-Place in the same folder as:
-    RideSharing.py, features.py, map_agent.png,
-    map_environment.png, pre_computed_distance_matrix.npy
-"""
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -43,63 +7,29 @@ import random
 from RideSharing import DynamicPricingEnv
 from features import get_features, set_env_bounds
 
-# =============================================================================
-# SEEDING  — set once at the top for full reproducibility
-# =============================================================================
+#seeding
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 
-# =============================================================================
-# HYPERPARAMETERS  (tune these)
-# =============================================================================
+#hyperparams
 
-N_BINS        = 20      # number of discrete price bins
-                        # 20 gives a step size of 0.05 which is fine-grained
-                        # enough to find a good price without blowing up
-                        # the parameter count.
+N_BINS        = 20      
+N_EPISODES    = 150     
+EPSILON_START = 1.0     
+EPSILON_MIN   = 0.05    
+EPSILON_DECAY = 0.997  
 
-N_EPISODES    = 150     # total training episodes (each = 720 timesteps)
+LAMBDA        = 1.0    
 
-EPSILON_START = 1.0     # start fully exploratory so every arm gets data
-EPSILON_MIN   = 0.05    # never drop below 5% exploration
-EPSILON_DECAY = 0.997   # multiplicative decay applied each timestep
+WINDOW_SIZE   = 2000    
 
-LAMBDA        = 1.0     # ridge regularisation coefficient
-                        # initialises A_i = lambda * I, keeping it invertible
-                        # even before an arm has been pulled
-
-WINDOW_SIZE   = 2000    # receding window size for the reward plot (recommended)
-
-# =============================================================================
-# FEATURE CONSTRUCTION
-# =============================================================================
-# features.py gives us an 8-dim context vector.
-# We append the normalised price and a bias term -> 10-dim phi.
-# Including the price inside phi lets the linear model learn how reward
-# scales with price for each context (instead of one scalar per arm).
 
 CONTEXT_DIM  = 8   # from features.py
 FEATURE_DIM  = CONTEXT_DIM + 2   # + price + bias  =  10
 
 
 def build_phi(context_features, price, max_price):
-    """
-    Concatenate context features with normalised price and bias.
-
-    Parameters
-    ----------
-    context_features : np.ndarray, shape (8,)
-        Output of features.get_features(context).
-    price : float
-        The candidate price for this arm.
-    max_price : float
-        env.MaxRideCost -- used to normalise price to [0, 1].
-
-    Returns
-    -------
-    np.ndarray, shape (10,), dtype float64
-    """
     price_norm = price / max_price          # normalise to [0, 1]
     return np.concatenate([
         context_features.astype(np.float64),
@@ -108,24 +38,9 @@ def build_phi(context_features, price, max_price):
     ])
 
 
-# =============================================================================
-# EPSILON-GREEDY LINEAR BANDIT
-# =============================================================================
 
 class EpsilonGreedyLinearBandit:
-    """
-    One ridge-regularised linear model per price bin (arm).
 
-    Model per arm i
-    ---------------
-        E[r | phi] = phi^T theta_i
-        theta_i    = A_i^{-1} b_i
-
-    Update (online least squares)
-    ------------------------------
-        A_i <- A_i + phi phi^T
-        b_i <- b_i + r * phi
-    """
 
     def __init__(self, n_bins, feature_dim, max_price, lambda_reg=LAMBDA):
         self.n_bins      = n_bins
@@ -133,35 +48,19 @@ class EpsilonGreedyLinearBandit:
         self.max_price   = max_price
         self.lambda_reg  = lambda_reg
 
-        # Bin centres: evenly spaced prices strictly inside (0, max_price)
         edges = np.linspace(0, max_price, n_bins + 1)
         self.action_values = (edges[:-1] + edges[1:]) / 2   # shape (n_bins,)
 
-        # One A and b per arm; A starts as lambda*I (ridge regularisation)
         self.A = [lambda_reg * np.eye(feature_dim) for _ in range(n_bins)]
         self.b = [np.zeros(feature_dim)            for _ in range(n_bins)]
 
-    # ------------------------------------------------------------------
+
     def _theta(self, i):
         """Solve A_i theta = b_i for theta_i."""
         return np.linalg.solve(self.A[i], self.b[i])
 
-    # ------------------------------------------------------------------
+
     def select_action(self, context_features, epsilon):
-        """
-        Epsilon-greedy arm selection.
-
-        Parameters
-        ----------
-        context_features : np.ndarray (8,)
-        epsilon          : float, current exploration rate
-
-        Returns
-        -------
-        arm_idx : int
-        price   : float   (centre of chosen bin)
-        phi     : np.ndarray (10,)
-        """
         if np.random.rand() < epsilon:
             # EXPLORE: random arm
             arm_idx = np.random.randint(self.n_bins)
@@ -179,27 +78,16 @@ class EpsilonGreedyLinearBandit:
         phi   = build_phi(context_features, price, self.max_price)
         return arm_idx, price, phi
 
-    # ------------------------------------------------------------------
     def update(self, arm_idx, phi, reward):
-        """
-        Online least-squares update for arm arm_idx.
 
-        A_i <- A_i + phi phi^T
-        b_i <- b_i + reward * phi
-        """
         self.A[arm_idx] += np.outer(phi, phi)
         self.b[arm_idx] += reward * phi
 
 
-# =============================================================================
-# RECEDING WINDOW AVERAGE
-# =============================================================================
+
 
 def receding_window_avg(rewards, window):
-    """
-    For each timestep t, compute mean(rewards[max(0, t-W+1) : t+1]).
-    This smooths the noisy per-step reward into a readable trend.
-    """
+
     rewards = np.array(rewards)
     result  = np.empty_like(rewards)
     for t in range(len(rewards)):
@@ -208,14 +96,12 @@ def receding_window_avg(rewards, window):
     return result
 
 
-# =============================================================================
-# TRAINING LOOP
-# =============================================================================
+
 
 def train():
-    # ------------------------------------------------------------------ setup
+
     env = DynamicPricingEnv()
-    env.reset()                  # reset the environment
+    env.reset()                  
     set_env_bounds(env)
 
     bandit = EpsilonGreedyLinearBandit(
@@ -239,7 +125,6 @@ def train():
     print(f"  Lambda     : {LAMBDA}")
     print("=" * 60)
 
-    # --------------------------------------------------------------- episodes
     for ep in range(N_EPISODES):
         context, _    = env.reset()
         ep_reward     = 0.0
@@ -279,7 +164,6 @@ def train():
     print(f"  Training done.  Total steps = {total_steps}")
     print("=" * 60)
 
-    # ------------------------------------------------------------------- plot
     smoothed = receding_window_avg(all_rewards, WINDOW_SIZE)
     steps    = np.arange(1, len(all_rewards) + 1)
 
@@ -297,10 +181,6 @@ def train():
     plt.show()
     print("  Plot saved → lin_greedy_reward.png")
 
-
-# =============================================================================
-# ENTRY POINT
-# =============================================================================
 
 if __name__ == "__main__":
     train()

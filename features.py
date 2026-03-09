@@ -1,38 +1,14 @@
-"""
-Provides:
-  1. A* shortest-path distance on map_agent.png
-  2. Feature extractor: raw context -> fixed-length numpy vector
-
-HOW TO USE:
-    from features import get_features, set_env_bounds
-
-    # Call ONCE after creating the environment
-    set_env_bounds(env)
-
-    # Call every time step
-    feature_vector = get_features(context)
-"""
-
 import numpy as np
 from PIL import Image
 import heapq
 
-# ---------------------------------------------------------------------------
-# 1. Load map
-#    White pixels (>=128) = road (walkable)
-#    Black pixels (<128)  = building (blocked)
-# ---------------------------------------------------------------------------
 
+#White pixels (>=128) = road (walkable)
+#Black pixels (<128)  = building (blocked)]
 _map_image  = Image.open("map_agent.png").convert("L")
 _map_array  = np.array(_map_image)
 MAP_HEIGHT, MAP_WIDTH = _map_array.shape
 ROAD = _map_array >= 128
-
-# ---------------------------------------------------------------------------
-# 2. Environment bounds
-#    Only uses env.observation_space 
-#    DELTA = size of one pixel in normalised units = max_x / MAP_WIDTH
-# ---------------------------------------------------------------------------
 
 _DELTA       = None
 _MAX_DRIVERS = None
@@ -41,14 +17,7 @@ _MAX_Y       = None
 
 
 def set_env_bounds(env):
-    """
-    Read coordinate bounds from env.observation_space.
-    Must be called once before using get_features() or astar_distance().
 
-    Parameters
-    ----------
-    env : DynamicPricingEnv instance
-    """
     global _DELTA, _MAX_X, _MAX_Y, _MAX_DRIVERS
     passenger_high = env.observation_space[0].high
     _MAX_X = float(passenger_high[0])
@@ -62,12 +31,6 @@ def _check_bounds():
         raise RuntimeError("Call set_env_bounds(env) once before using features.")
 
 
-# ---------------------------------------------------------------------------
-# 3. Coordinate conversion
-#    Observation gives normalised floats: x = col * delta, y = row * delta
-#    We convert back to integer (row, col) for map lookups.
-# ---------------------------------------------------------------------------
-
 def _to_pixel(x, y):
     col = int(round(float(x) / _DELTA))
     row = int(round(float(y) / _DELTA))
@@ -77,10 +40,7 @@ def _to_pixel(x, y):
 
 
 def _nearest_road(row, col):
-    """
-    If (row, col) is a building pixel, BFS outward to find the nearest road.
-    Handles coordinates that land just inside a building boundary.
-    """
+
     if ROAD[row, col]:
         return row, col
     from collections import deque
@@ -99,54 +59,10 @@ def _nearest_road(row, col):
     return row, col
 
 
-# ---------------------------------------------------------------------------
-# 4. A* shortest-path
-#
-# Inspired by shortest_path() in RideSharing.py -- we use the same algorithm
-# choice (A*) and the same 4-directional (Manhattan-style) movement on the
-# road pixels of map_agent.png.
-#
-# Heuristic: plain Manhattan distance to destination.
-#   h(r, c) = |r - dst_r| + |c - dst_c|
-# This is admissible (never overestimates the true road distance) so A*
-# is guaranteed to find the optimal path.
-#
-# Pseudocode
-# ----------
-# 1. Convert normalised (x,y) to pixel (row, col)
-# 2. Snap any building pixels to nearest road pixel
-# 3. Initialise: g(src) = 0, push (f = h(src), src) to priority queue
-# 4. While queue not empty:
-#      a. Pop pixel with smallest f = g + h
-#      b. If pixel == dst: return g(pixel) * delta
-#      c. For each 4-connected road neighbour:
-#           tentative_g = g(current) + 1
-#           if tentative_g < known g for neighbour:
-#               g(neighbour) = tentative_g
-#               push (tentative_g + h(neighbour), neighbour)
-# 5. If queue empties: return map diagonal as penalty
-#
-# Caching
-# -------
-# Results stored in _astar_cache so each unique (src, dst) pair is only
-# ever computed once across all episodes. 
-
 _astar_cache = {}
 
 
 def astar_distance(src_xy, dst_xy):
-    """
-    Shortest path distance between two normalised (x, y) coordinate pairs.
-
-    Parameters
-    ----------
-    src_xy : (float, float)   normalised (x, y) from the observation
-    dst_xy : (float, float)   normalised (x, y) from the observation
-
-    Returns
-    -------
-    float  -- distance in normalised units (same scale as observation coords)
-    """
     _check_bounds()
 
     src_rc = _to_pixel(*src_xy)
@@ -195,60 +111,11 @@ def astar_distance(src_xy, dst_xy):
 
 
 def clear_cache():
-    """Free memory by clearing the A* cache."""
     _astar_cache.clear()
 
 
-# ---------------------------------------------------------------------------
-# 5. Feature extractor
-# ---------------------------------------------------------------------------
 
 def get_features(context):
-    """
-    Convert a raw DynamicPricingEnv context into a fixed-length numpy vector.
-    ---------------------------------------------------
-    context = (passenger_info, driver_info)
-        passenger_info : np.array([x_o, y_o, x_f, y_f, alpha_passenger])
-        driver_info    : tuple of np.arrays, each [x_d, y_d, alpha_driver]
-
-    Feature vector  (8 elements)
-    ----------------------------
-    Index  Name                   Description
-    -----  ---------------------  ------------------------------------------------
-      0    trip_distance          A* distance: passenger origin -> destination.
-                                  Longer trips justify higher prices.
-
-      1    nearest_driver_dist    A* distance: nearest driver -> passenger origin.
-                                  Far drivers are less likely to accept the ride.
-
-      2    avg_driver_dist        Average A* distance of all drivers -> passenger.
-                                  Reflects overall driver supply accessibility.
-
-      3    alpha_passenger        Passenger price sensitivity (noisy estimate).
-                                  Higher = willing to pay more per unit distance.
-
-      4    avg_alpha_driver       Average driver price sensitivity.
-
-      5    min_alpha_driver       Minimum driver alpha (most eager/cheapest driver).
-                                  Most relevant for whether a booking succeeds.
-
-      6    num_drivers            Number of nearby drivers, normalised by max (10).
-                                  More supply -> lower price needed.
-
-      7    price_gap              alpha_passenger - min_alpha_driver.
-                                  Positive: passenger willing to pay more than the
-                                  cheapest driver demands -> booking likely.
-                                  Negative: expectations mismatched -> hard to book.
-                                  Pre-computing this interaction helps linear models
-                                  since they cannot multiply features on their own.
-
-    All distance features normalised by map diagonal so they fall in [0, 1],
-    same scale as the alpha features.
-
-    Returns
-    -------
-    np.ndarray, shape (8,), dtype float32
-    """
     _check_bounds()
 
     passenger_info, driver_info = context
@@ -286,9 +153,6 @@ def get_features(context):
     ], dtype=np.float32)
 
 
-# ---------------------------------------------------------------------------
-# 6. Sanity check  (run:  python features.py)
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import time
